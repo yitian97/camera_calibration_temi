@@ -39,9 +39,10 @@ class CameraExtrinsicsEstimator:
         self.dist_coeffs = None
         self.calibrated = False
         
-        # ArUco dictionary and parameters
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        # ArUco dictionary and parameters (OpenCV 4.x+ API)
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         
         # Checkerboard parameters (alternative to ArUco)
         self.checkerboard_size = (9, 6)  # Internal corners
@@ -166,36 +167,63 @@ class CameraExtrinsicsEstimator:
             print(f"Error saving calibration: {e}")
             return False
     
-    def estimate_pose_aruco(self, frame) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def estimate_pose_aruco(self, frame, skip_calibration: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Estimate camera pose using ArUco marker detection."""
-        if not self.calibrated:
+        if not self.calibrated and not skip_calibration:
             return None, None
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Detect ArUco markers
-        corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+        # Detect ArUco markers (OpenCV 4.x+ API)
+        corners, ids, rejected = self.aruco_detector.detectMarkers(gray)
         
         if ids is not None and len(ids) > 0:
-            # Estimate pose of the marker
-            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                corners, self.marker_size, self.camera_matrix, self.dist_coeffs
-            )
+            if skip_calibration:
+                # Use default camera matrix for rough estimation
+                h, w = frame.shape[:2]
+                fx = fy = max(h, w)  # Rough focal length estimate
+                cx, cy = w/2, h/2    # Image center
+                camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+                dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+            else:
+                camera_matrix = self.camera_matrix
+                dist_coeffs = self.dist_coeffs
             
+            # Define marker corners in 3D space
+            marker_corners_3d = np.array([
+                [-self.marker_size/2, self.marker_size/2, 0],
+                [self.marker_size/2, self.marker_size/2, 0],
+                [self.marker_size/2, -self.marker_size/2, 0],
+                [-self.marker_size/2, -self.marker_size/2, 0]
+            ], dtype=np.float32)
+            
+            rvecs = []
+            tvecs = []
+            for i in range(len(ids)):
+                # solvePnP for each detected marker
+                success, rvec, tvec = cv2.solvePnP(
+                    marker_corners_3d, corners[i], camera_matrix, dist_coeffs
+                )
+                if success:
+                    rvecs.append(rvec)
+                    tvecs.append(tvec)
+
             # Draw marker and pose
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-            
-            for i in range(len(ids)):
-                cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, 
-                                rvecs[i], tvecs[i], self.marker_size * 0.5)
-            
-            return rvecs[0], tvecs[0]
-        
+            for i in range(len(rvecs)):
+                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvecs[i], tvecs[i], self.marker_size * 0.5)
+
+            # 返回第一个 marker 的 rvec/tvec
+            if rvecs and tvecs:
+                return rvecs[0], tvecs[0]
+            else:
+                return None, None
+
         return None, None
     
-    def estimate_pose_checkerboard(self, frame) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def estimate_pose_checkerboard(self, frame, skip_calibration: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Estimate camera pose using checkerboard detection."""
-        if not self.calibrated:
+        if not self.calibrated and not skip_calibration:
             return None, None
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -209,15 +237,26 @@ class CameraExtrinsicsEstimator:
             objp[:, :2] = np.mgrid[0:self.checkerboard_size[0], 0:self.checkerboard_size[1]].T.reshape(-1, 2)
             objp *= self.checkerboard_square_size
             
+            if skip_calibration:
+                # Use default camera matrix for rough estimation
+                h, w = frame.shape[:2]
+                fx = fy = max(h, w)  # Rough focal length estimate
+                cx, cy = w/2, h/2    # Image center
+                camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+                dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+            else:
+                camera_matrix = self.camera_matrix
+                dist_coeffs = self.dist_coeffs
+            
             # Solve PnP
-            ret, rvec, tvec = cv2.solvePnP(objp, corners, self.camera_matrix, self.dist_coeffs)
+            ret, rvec, tvec = cv2.solvePnP(objp, corners, camera_matrix, dist_coeffs)
             
             if ret:
                 # Draw checkerboard corners
                 cv2.drawChessboardCorners(frame, self.checkerboard_size, corners, ret)
                 
                 # Draw coordinate axes
-                cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, 
+                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, 
                                 rvec, tvec, 0.1)
                 
                 return rvec, tvec
@@ -244,23 +283,30 @@ class CameraExtrinsicsEstimator:
         
         return np.degrees(x), np.degrees(y), np.degrees(z)
     
-    def run_extrinsics_estimation(self, use_aruco: bool = True):
+    def run_extrinsics_estimation(self, use_aruco: bool = True, skip_calibration: bool = False):
         """Main loop for extrinsics estimation."""
         if not self.initialize_camera():
             return
         
-        # Try to load existing calibration first
-        # if not self.load_calibration('camera_calibration.npz'):
-        #     print("No existing calibration found. Starting calibration process...")
-        #     if not self.calibrate_camera():
-        #         print("Calibration failed. Exiting.")
-        #         return
-        #     self.save_calibration('camera_calibration.npz')
+        # Try to load existing calibration first (unless skipping)
+        if not skip_calibration:
+            if not self.load_calibration('camera_calibration.npz'):
+                print("No existing calibration found. Starting calibration process...")
+                if not self.calibrate_camera():
+                    print("Calibration failed. Exiting.")
+                    return
+                self.save_calibration('camera_calibration.npz')
+        else:
+            print("Skipping intrinsic calibration - using rough camera parameters")
         
         print("\n=== Extrinsics Estimation ===")
         print("Point the camera at the marker/checkerboard at your ground point (0,0)")
-        print("Press 'q' to quit")
+        print("Press 'q' to quit, 's' to save extrinsics")
+        if skip_calibration:
+            print("WARNING: Using uncalibrated camera - results may be less accurate")
         
+        last_rvec, last_tvec = None, None
+
         while True:
             ret, frame = self.cap.read()
             if not ret:
@@ -268,11 +314,13 @@ class CameraExtrinsicsEstimator:
             
             # Estimate pose
             if use_aruco:
-                rvec, tvec = self.estimate_pose_aruco(frame)
+                rvec, tvec = self.estimate_pose_aruco(frame, skip_calibration)
             else:
-                rvec, tvec = self.estimate_pose_checkerboard(frame)
+                rvec, tvec = self.estimate_pose_checkerboard(frame, skip_calibration)
             
             if rvec is not None and tvec is not None:
+                last_rvec, last_tvec = rvec, tvec
+
                 # Convert to more readable format
                 position = tvec.flatten()
                 rotation_euler = self.rotation_vector_to_euler(rvec)
@@ -283,17 +331,29 @@ class CameraExtrinsicsEstimator:
                 cv2.putText(frame, f"Rotation (Roll,Pitch,Yaw): ({rotation_euler[0]:.1f}, {rotation_euler[1]:.1f}, {rotation_euler[2]:.1f})", 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
+                if skip_calibration:
+                    cv2.putText(frame, "UNCALIBRATED - Results may be inaccurate", 
+                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
                 # Print to console
                 print(f"\rCamera Position: X={position[0]:.3f}m, Y={position[1]:.3f}m, Z={position[2]:.3f}m", end="")
                 print(f" | Rotation: Roll={rotation_euler[0]:.1f}°, Pitch={rotation_euler[1]:.1f}°, Yaw={rotation_euler[2]:.1f}°", end="")
             else:
                 cv2.putText(frame, "No marker detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
+            cv2.putText(frame, "Press 'q' to quit, 's' to save extrinsics", (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
             cv2.imshow('Camera Extrinsics Estimation', frame)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
-        
+            elif key == ord('s'):
+                if last_rvec is not None and last_tvec is not None:
+                    np.savez('extrinsics.npz', rvec=last_rvec, tvec=last_tvec)
+                    print("\n💾 Extrinsics saved to extrinsics.npz (rvec, tvec)")
+                else:
+                    print("\n❌ No valid extrinsics to save!")
+
         self.cleanup()
     
     def cleanup(self):
@@ -310,6 +370,7 @@ def main():
     parser.add_argument('--marker-size', type=float, default=0.05, help='ArUco marker size in meters (default: 0.05)')
     parser.add_argument('--use-checkerboard', action='store_true', help='Use checkerboard instead of ArUco marker')
     parser.add_argument('--calibrate-only', action='store_true', help='Only perform camera calibration')
+    parser.add_argument('--skip-calibration', action='store_true', help='Skip intrinsic calibration and use rough camera parameters')
     
     args = parser.parse_args()
     
@@ -321,9 +382,8 @@ def main():
             estimator.save_calibration('camera_calibration.npz')
             estimator.cleanup()
     else:
-        estimator.run_extrinsics_estimation(use_aruco=not args.use_checkerboard)
+        estimator.run_extrinsics_estimation(use_aruco=not args.use_checkerboard, skip_calibration=args.skip_calibration)
 
 
 if __name__ == "__main__":
     main()
-
