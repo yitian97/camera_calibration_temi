@@ -314,22 +314,51 @@ class CameraExtrinsicsEstimator:
     
     def opencv_to_optitrack(self, rvec: np.ndarray, tvec: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        将OpenCV坐标系(X右,Y下,Z前)的位姿转换为OptiTrack坐标系(X左,Y上,Z前)。
-        变换方式：X轴取反，Y轴取反。
+        将标记到相机的变换(marker_to_camera)转换为OptiTrack世界坐标系到相机的变换。
+
+        步骤：
+        1. solvePnP 返回的是 marker_to_camera (标记本地坐标系到相机)
+        2. 标记本地坐标系: X-right, Y-forward, Z-up
+        3. OptiTrack 世界坐标系: X-left, Y-up, Z-forward
+        4. 需要先将标记坐标系转换到世界坐标系，再到相机坐标系
+
+        Args:
+            rvec: 标记到相机的旋转向量(OpenCV坐标系)
+            tvec: 标记到相机的平移向量(OpenCV坐标系)
+
+        Returns:
+            rvec_world_to_camera: OptiTrack世界坐标系到相机的旋转向量
+            tvec_world_to_camera: OptiTrack世界坐标系到相机的平移向量
         """
-        R_opencv, _ = cv2.Rodrigues(rvec)
+        # Step 1: 将 marker_to_camera 的 OpenCV 表示转换为旋转矩阵
+        R_marker_to_camera_opencv, _ = cv2.Rodrigues(rvec)
+        t_marker_to_camera_opencv = tvec
+
+        # Step 2: 定义标记本地坐标系到OptiTrack世界坐标系的变换
+        # 标记本地: X-right, Y-forward, Z-up
         # OptiTrack: X-left, Y-up, Z-forward
-        # OpenCV: X-right, Y-down, Z-forward
-        # Transformation: flip X and Y axes
-        T = np.array([
-            [-1, 0, 0],  # Flip X (right -> left)
-            [0, -1, 0],  # Flip Y (down -> up)
-            [0, 0, 1]
-        ])
-        R_optitrack = T @ R_opencv @ T.T
-        rvec_optitrack, _ = cv2.Rodrigues(R_optitrack)
-        tvec_optitrack = T @ tvec
-        return rvec_optitrack, tvec_optitrack
+        # 变换: Marker X -> World -X, Marker Y -> World Z, Marker Z -> World Y
+        R_marker_to_world = np.array([
+            [-1, 0, 0],  # Marker X (right) -> World -X (becomes left)
+            [0, 0, 1],   # Marker Z (up) -> World Y (up)
+            [0, 1, 0]    # Marker Y (forward) -> World Z (forward)
+        ], dtype=np.float32)
+
+        # 世界到标记的变换(逆变换)
+        R_world_to_marker = R_marker_to_world.T
+        t_world_to_marker = np.zeros((3, 1))  # 标记中心在世界原点
+
+        # Step 3: 链式变换 world -> marker -> camera
+        # R_world_to_camera = R_marker_to_camera @ R_world_to_marker
+        # t_world_to_camera = R_marker_to_camera @ t_world_to_marker + t_marker_to_camera
+        R_world_to_camera_opencv = R_marker_to_camera_opencv @ R_world_to_marker
+        t_world_to_camera_opencv = R_marker_to_camera_opencv @ t_world_to_marker + t_marker_to_camera_opencv
+
+        # Step 4: 转换为旋转向量
+        rvec_world_to_camera, _ = cv2.Rodrigues(R_world_to_camera_opencv)
+        tvec_world_to_camera = t_world_to_camera_opencv
+
+        return rvec_world_to_camera, tvec_world_to_camera
 
     def run_extrinsics_estimation(self, use_aruco: bool = True, skip_calibration: bool = False, use_optitrack_coords: bool = True):
         """Main loop for extrinsics estimation."""
