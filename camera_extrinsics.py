@@ -24,16 +24,18 @@ import sys
 from typing import Tuple, Optional
 
 class CameraExtrinsicsEstimator:
-    def __init__(self, camera_id: int = 0, marker_size: float = 0.05):
+    def __init__(self, camera_id: int = 0, marker_size: float = 0.05, video_file: str = None):
         """
         Initialize the camera extrinsics estimator.
         
         Args:
             camera_id: Camera device ID (usually 0 for default webcam)
             marker_size: Physical size of the marker in meters
+            video_file: Path to video file (if provided, will use video instead of camera)
         """
         self.camera_id = camera_id
         self.marker_size = marker_size
+        self.video_file = video_file
         self.cap = None
         self.camera_matrix = None
         self.dist_coeffs = None
@@ -49,22 +51,43 @@ class CameraExtrinsicsEstimator:
         self.checkerboard_square_size = 0.025  # 25mm squares
         
     def initialize_camera(self) -> bool:
-        """Initialize the camera and attempt to calibrate it."""
-        print("Initializing camera...")
-        self.cap = cv2.VideoCapture(self.camera_id)
-        
-        if not self.cap.isOpened():
-            print(f"Error: Could not open camera {self.camera_id}")
-            return False
-            
-        # Set camera properties for better quality
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
-        print("Camera initialized successfully")
-        return True
-    
+        """Initialize the camera or video file."""
+        if self.video_file:
+            print(f"Opening video file: {self.video_file}...")
+            self.cap = cv2.VideoCapture(self.video_file)
+
+            if not self.cap.isOpened():
+                print(f"Error: Could not open video file {self.video_file}")
+                return False
+
+            # Get video properties
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            print(f"Video opened successfully")
+            print(f"  Resolution: {width}x{height}")
+            print(f"  FPS: {fps:.2f}")
+            print(f"  Total frames: {frame_count}")
+            print(f"  Duration: {frame_count/fps:.2f} seconds")
+            return True
+        else:
+            print("Initializing camera...")
+            self.cap = cv2.VideoCapture(self.camera_id)
+
+            if not self.cap.isOpened():
+                print(f"Error: Could not open camera {self.camera_id}")
+                return False
+
+            # Set camera properties for better quality
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+            print("Camera initialized successfully")
+            return True
+
     def calibrate_camera(self) -> bool:
         """
         Perform camera calibration using a checkerboard pattern.
@@ -374,26 +397,61 @@ class CameraExtrinsicsEstimator:
                 self.save_calibration('camera_calibration.npz')
         else:
             print("Skipping intrinsic calibration - using rough camera parameters")
+
         print("\n=== Extrinsics Estimation ===")
         if use_optitrack_coords:
-            print("📍 Coordinate System: OptiTrack (X-right, Y-up, Z-forward)")
+            print("📍 Coordinate System: OptiTrack (X-left, Y-up, Z-forward)")
             print("   Place marker flat on ground with Z-axis pointing forward")
         else:
             print("📍 Coordinate System: OpenCV (X-right, Y-down, Z-forward)")
-        print("Point the camera at the marker/checkerboard at your ground point (0,0)")
-        print("Press 'q' to quit, 's' to save extrinsics")
+
+        if self.video_file:
+            print(f"Processing video: {self.video_file}")
+            print("Press 's' to save extrinsics when good detection is found")
+            print("Press 'q' to quit")
+            print("Press SPACE to pause/resume")
+        else:
+            print("Point the camera at the marker/checkerboard at your ground point (0,0)")
+            print("Press 'q' to quit, 's' to save extrinsics")
+
         if skip_calibration:
             print("WARNING: Using uncalibrated camera - results may be less accurate")
+
         last_rvec, last_tvec = None, None
+        frame_count = 0
+        paused = False
+
+        # For video playback control
+        if self.video_file:
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            delay = int(1000 / fps) if fps > 0 else 30
+        else:
+            delay = 1
+
         while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
+            if not paused:
+                ret, frame = self.cap.read()
+                if not ret:
+                    if self.video_file:
+                        print("\n\n🎬 End of video reached")
+                        if last_rvec is not None and last_tvec is not None:
+                            response = input("Save last detected extrinsics? (y/n): ").strip().lower()
+                            if response == 'y':
+                                coord_system = 'optitrack' if use_optitrack_coords else 'opencv'
+                                np.savez(f'extrinsics_{coord_system}.npz', rvec=last_rvec, tvec=last_tvec, coordinate_system=coord_system)
+                                print(f"💾 Extrinsics saved to extrinsics_{coord_system}.npz")
+                        break
+                    continue
+
+                frame_count += 1
+
             # Estimate pose (OpenCV坐标系)
             if use_aruco:
                 rvec, tvec = self.estimate_pose_aruco(frame, skip_calibration, use_optitrack_coords)
             else:
                 rvec, tvec = self.estimate_pose_checkerboard(frame, skip_calibration)
+
             if rvec is not None and tvec is not None:
                 # 转换到OptiTrack坐标系（如需）
                 if use_optitrack_coords:
@@ -405,37 +463,66 @@ class CameraExtrinsicsEstimator:
                 last_rvec, last_tvec = rvec_disp, tvec_disp
                 position = tvec_disp.flatten()
                 rotation_euler = self.rotation_vector_to_euler(rvec_disp)
+
                 # Display information
                 cv2.putText(frame, f"Position (X,Y,Z): ({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Rotation (Roll,Pitch,Yaw): ({rotation_euler[0]:.1f}, {rotation_euler[1]:.1f}, {rotation_euler[2]:.1f})", 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Coordinate System: {coord_label}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+
                 if skip_calibration:
                     cv2.putText(frame, "UNCALIBRATED - Results may be inaccurate", 
                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
                 # Print to console
-                print(f"\rCamera Position: X={position[0]:.3f}m, Y={position[1]:.3f}m, Z={position[2]:.3f}m", end="")
-                print(f" | Rotation: Roll={rotation_euler[0]:.1f}°, Pitch={rotation_euler[1]:.1f}°, Yaw={rotation_euler[2]:.1f}°", end="")
+                if self.video_file:
+                    progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                    print(f"\rFrame {frame_count}/{total_frames} ({progress:.1f}%) | "
+                          f"Pos: X={position[0]:.3f}m Y={position[1]:.3f}m Z={position[2]:.3f}m | "
+                          f"Rot: R={rotation_euler[0]:.1f}° P={rotation_euler[1]:.1f}° Y={rotation_euler[2]:.1f}°", end="")
+                else:
+                    print(f"\rCamera Position: X={position[0]:.3f}m, Y={position[1]:.3f}m, Z={position[2]:.3f}m", end="")
+                    print(f" | Rotation: Roll={rotation_euler[0]:.1f}°, Pitch={rotation_euler[1]:.1f}°, Yaw={rotation_euler[2]:.1f}°", end="")
             else:
                 cv2.putText(frame, "No marker detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(frame, "Press 'q' to quit, 's' to save extrinsics", (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+                if self.video_file:
+                    progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                    print(f"\rFrame {frame_count}/{total_frames} ({progress:.1f}%) | No marker detected", end="")
+
+            # Add video-specific controls
+            if self.video_file:
+                status_text = "PAUSED" if paused else "PLAYING"
+                cv2.putText(frame, f"[{status_text}] Frame: {frame_count}/{total_frames}",
+                           (10, frame.shape[0]-40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(frame, "SPACE=Pause | s=Save | q=Quit",
+                           (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            else:
+                cv2.putText(frame, "Press 'q' to quit, 's' to save extrinsics",
+                           (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+
             cv2.imshow('Camera Extrinsics Estimation', frame)
-            key = cv2.waitKey(1) & 0xFF
+
+            key = cv2.waitKey(delay) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('s'):
                 if last_rvec is not None and last_tvec is not None:
                     coord_system = 'optitrack' if use_optitrack_coords else 'opencv'
-                    np.savez(f'extrinsics_{coord_system}.npz', rvec=last_rvec, tvec=last_tvec, coordinate_system=coord_system)
-                    print(f"\n💾 Extrinsics saved to extrinsics_{coord_system}.npz")
+                    filename = f'extrinsics_{coord_system}.npz'
+                    np.savez(filename, rvec=last_rvec, tvec=last_tvec, coordinate_system=coord_system)
+                    print(f"\n💾 Extrinsics saved to {filename}")
                     print(f"   Position (X,Y,Z): {last_tvec.flatten()}")
                     if use_optitrack_coords:
-                        print(f"   Coordinate System: OptiTrack (X-right, Y-up, Z-forward)")
+                        print(f"   Coordinate System: OptiTrack (X-left, Y-up, Z-forward)")
                     else:
                         print(f"   Coordinate System: OpenCV (X-right, Y-down, Z-forward)")
                 else:
                     print("\n❌ No valid extrinsics to save!")
+            elif key == ord(' ') and self.video_file:
+                paused = not paused
+                print(f"\n{'⏸️  PAUSED' if paused else '▶️  RESUMED'}")
+
         self.cleanup()
     
     def cleanup(self):
@@ -447,22 +534,38 @@ class CameraExtrinsicsEstimator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Estimate camera extrinsics from webcam')
+    parser = argparse.ArgumentParser(description='Estimate camera extrinsics from webcam or video file')
     parser.add_argument('--camera', type=int, default=0, help='Camera device ID (default: 0)')
-    parser.add_argument('--marker-size', type=float, default=0.09, help='ArUco marker size in meters (default: 0.05)')
+    parser.add_argument('--video', type=str, help='Path to video file (alternative to camera)')
+    parser.add_argument('--marker-size', type=float, default=0.09, help='ArUco marker size in meters (default: 0.09)')
     parser.add_argument('--use-checkerboard', action='store_true', help='Use checkerboard instead of ArUco marker')
     parser.add_argument('--calibrate-only', action='store_true', help='Only perform camera calibration')
     parser.add_argument('--skip-calibration', action='store_true', help='Skip intrinsic calibration and use rough camera parameters')
     parser.add_argument('--opencv-coords', action='store_true', help='Output in OpenCV coordinate system (default: OptiTrack)')
+
     args = parser.parse_args()
-    estimator = CameraExtrinsicsEstimator(camera_id=args.camera, marker_size=args.marker_size)
+
+    estimator = CameraExtrinsicsEstimator(
+        camera_id=args.camera,
+        marker_size=args.marker_size,
+        video_file=args.video
+    )
+
     if args.calibrate_only:
+        if args.video:
+            print("❌ Calibration mode cannot be used with video file")
+            print("   Please use live camera for calibration")
+            return
         if estimator.initialize_camera():
             estimator.calibrate_camera()
             estimator.save_calibration('camera_calibration.npz')
             estimator.cleanup()
     else:
-        estimator.run_extrinsics_estimation(use_aruco=not args.use_checkerboard, skip_calibration=args.skip_calibration, use_optitrack_coords=not args.opencv_coords)
+        estimator.run_extrinsics_estimation(
+            use_aruco=not args.use_checkerboard,
+            skip_calibration=args.skip_calibration,
+            use_optitrack_coords=not args.opencv_coords
+        )
 
 
 if __name__ == "__main__":
