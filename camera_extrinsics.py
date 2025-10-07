@@ -167,7 +167,7 @@ class CameraExtrinsicsEstimator:
             print(f"Error saving calibration: {e}")
             return False
     
-    def estimate_pose_aruco(self, frame, skip_calibration: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def estimate_pose_aruco(self, frame, skip_calibration: bool = False, use_optitrack_coords: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Estimate camera pose using ArUco marker detection."""
         if not self.calibrated and not skip_calibration:
             return None, None
@@ -189,12 +189,16 @@ class CameraExtrinsicsEstimator:
                 camera_matrix = self.camera_matrix
                 dist_coeffs = self.dist_coeffs
             
-            # Define marker corners in 3D space
+            # Define marker corners in 3D space (OpenCV convention: X-right, Y-down, Z-forward)
+            # When marker is on ground, this defines a marker lying flat with:
+            # - X pointing right
+            # - Y pointing forward (marker top direction)
+            # - Z pointing up (perpendicular to marker plane)
             marker_corners_3d = np.array([
-                [-self.marker_size/2, self.marker_size/2, 0],
-                [self.marker_size/2, self.marker_size/2, 0],
-                [self.marker_size/2, -self.marker_size/2, 0],
-                [-self.marker_size/2, -self.marker_size/2, 0]
+                [-self.marker_size/2, self.marker_size/2, 0],   # top-left
+                [self.marker_size/2, self.marker_size/2, 0],    # top-right
+                [self.marker_size/2, -self.marker_size/2, 0],   # bottom-right
+                [-self.marker_size/2, -self.marker_size/2, 0]   # bottom-left
             ], dtype=np.float32)
             
             rvecs = []
@@ -208,10 +212,35 @@ class CameraExtrinsicsEstimator:
                     rvecs.append(rvec)
                     tvecs.append(tvec)
 
-            # Draw marker and pose
+            # Draw marker detection
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+            # Draw coordinate axes
             for i in range(len(rvecs)):
-                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvecs[i], tvecs[i], self.marker_size * 0.5)
+                if use_optitrack_coords:
+                    # Transform to OptiTrack coordinate system for visualization
+                    # OptiTrack: X-left, Y-up, Z-forward
+                    # Marker local: X-right, Y-forward, Z-up
+                    # We need to rotate the axes to show OptiTrack world frame
+
+                    # Rotation from marker local to OptiTrack world:
+                    # Marker X (right) -> OptiTrack -X (left becomes positive right in display)
+                    # Marker Y (forward) -> OptiTrack Z (forward)
+                    # Marker Z (up) -> OptiTrack Y (up)
+                    R_marker_to_optitrack = np.array([
+                        [-1, 0, 0],  # Marker X (right) -> -X (left)
+                        [0, 0, 1],   # Marker Z (up) -> Y (up)
+                        [0, 1, 0]    # Marker Y (forward) -> Z (forward)
+                    ], dtype=np.float32)
+
+                    R_marker, _ = cv2.Rodrigues(rvecs[i])
+                    R_optitrack = R_marker @ R_marker_to_optitrack
+                    rvec_viz, _ = cv2.Rodrigues(R_optitrack)
+
+                    cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec_viz, tvecs[i], self.marker_size * 0.5)
+                else:
+                    # Draw marker local coordinate system
+                    cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvecs[i], tvecs[i], self.marker_size * 0.5)
 
             # 返回第一个 marker 的 rvec/tvec
             if rvecs and tvecs:
@@ -283,11 +312,29 @@ class CameraExtrinsicsEstimator:
         
         return np.degrees(x), np.degrees(y), np.degrees(z)
     
-    def run_extrinsics_estimation(self, use_aruco: bool = True, skip_calibration: bool = False):
+    def opencv_to_optitrack(self, rvec: np.ndarray, tvec: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        将OpenCV坐标系(X右,Y下,Z前)的位姿转换为OptiTrack坐标系(X左,Y上,Z前)。
+        变换方式：X轴取反，Y轴取反。
+        """
+        R_opencv, _ = cv2.Rodrigues(rvec)
+        # OptiTrack: X-left, Y-up, Z-forward
+        # OpenCV: X-right, Y-down, Z-forward
+        # Transformation: flip X and Y axes
+        T = np.array([
+            [-1, 0, 0],  # Flip X (right -> left)
+            [0, -1, 0],  # Flip Y (down -> up)
+            [0, 0, 1]
+        ])
+        R_optitrack = T @ R_opencv @ T.T
+        rvec_optitrack, _ = cv2.Rodrigues(R_optitrack)
+        tvec_optitrack = T @ tvec
+        return rvec_optitrack, tvec_optitrack
+
+    def run_extrinsics_estimation(self, use_aruco: bool = True, skip_calibration: bool = False, use_optitrack_coords: bool = True):
         """Main loop for extrinsics estimation."""
         if not self.initialize_camera():
             return
-        
         # Try to load existing calibration first (unless skipping)
         if not skip_calibration:
             if not self.load_calibration('camera_calibration.npz'):
@@ -298,62 +345,68 @@ class CameraExtrinsicsEstimator:
                 self.save_calibration('camera_calibration.npz')
         else:
             print("Skipping intrinsic calibration - using rough camera parameters")
-        
         print("\n=== Extrinsics Estimation ===")
+        if use_optitrack_coords:
+            print("📍 Coordinate System: OptiTrack (X-right, Y-up, Z-forward)")
+            print("   Place marker flat on ground with Z-axis pointing forward")
+        else:
+            print("📍 Coordinate System: OpenCV (X-right, Y-down, Z-forward)")
         print("Point the camera at the marker/checkerboard at your ground point (0,0)")
         print("Press 'q' to quit, 's' to save extrinsics")
         if skip_calibration:
             print("WARNING: Using uncalibrated camera - results may be less accurate")
-        
         last_rvec, last_tvec = None, None
-
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 continue
-            
-            # Estimate pose
+            # Estimate pose (OpenCV坐标系)
             if use_aruco:
-                rvec, tvec = self.estimate_pose_aruco(frame, skip_calibration)
+                rvec, tvec = self.estimate_pose_aruco(frame, skip_calibration, use_optitrack_coords)
             else:
                 rvec, tvec = self.estimate_pose_checkerboard(frame, skip_calibration)
-            
             if rvec is not None and tvec is not None:
-                last_rvec, last_tvec = rvec, tvec
-
-                # Convert to more readable format
-                position = tvec.flatten()
-                rotation_euler = self.rotation_vector_to_euler(rvec)
-                
+                # 转换到OptiTrack坐标系（如需）
+                if use_optitrack_coords:
+                    rvec_disp, tvec_disp = self.opencv_to_optitrack(rvec, tvec)
+                    coord_label = "OptiTrack"
+                else:
+                    rvec_disp, tvec_disp = rvec, tvec
+                    coord_label = "OpenCV"
+                last_rvec, last_tvec = rvec_disp, tvec_disp
+                position = tvec_disp.flatten()
+                rotation_euler = self.rotation_vector_to_euler(rvec_disp)
                 # Display information
                 cv2.putText(frame, f"Position (X,Y,Z): ({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Rotation (Roll,Pitch,Yaw): ({rotation_euler[0]:.1f}, {rotation_euler[1]:.1f}, {rotation_euler[2]:.1f})", 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
+                cv2.putText(frame, f"Coordinate System: {coord_label}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
                 if skip_calibration:
                     cv2.putText(frame, "UNCALIBRATED - Results may be inaccurate", 
-                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
+                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 # Print to console
                 print(f"\rCamera Position: X={position[0]:.3f}m, Y={position[1]:.3f}m, Z={position[2]:.3f}m", end="")
                 print(f" | Rotation: Roll={rotation_euler[0]:.1f}°, Pitch={rotation_euler[1]:.1f}°, Yaw={rotation_euler[2]:.1f}°", end="")
             else:
                 cv2.putText(frame, "No marker detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
             cv2.putText(frame, "Press 'q' to quit, 's' to save extrinsics", (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
             cv2.imshow('Camera Extrinsics Estimation', frame)
-            
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('s'):
                 if last_rvec is not None and last_tvec is not None:
-                    np.savez('extrinsics.npz', rvec=last_rvec, tvec=last_tvec)
-                    print("\n💾 Extrinsics saved to extrinsics.npz (rvec, tvec)")
+                    coord_system = 'optitrack' if use_optitrack_coords else 'opencv'
+                    np.savez(f'extrinsics_{coord_system}.npz', rvec=last_rvec, tvec=last_tvec, coordinate_system=coord_system)
+                    print(f"\n💾 Extrinsics saved to extrinsics_{coord_system}.npz")
+                    print(f"   Position (X,Y,Z): {last_tvec.flatten()}")
+                    if use_optitrack_coords:
+                        print(f"   Coordinate System: OptiTrack (X-right, Y-up, Z-forward)")
+                    else:
+                        print(f"   Coordinate System: OpenCV (X-right, Y-down, Z-forward)")
                 else:
                     print("\n❌ No valid extrinsics to save!")
-
         self.cleanup()
     
     def cleanup(self):
@@ -367,22 +420,20 @@ class CameraExtrinsicsEstimator:
 def main():
     parser = argparse.ArgumentParser(description='Estimate camera extrinsics from webcam')
     parser.add_argument('--camera', type=int, default=0, help='Camera device ID (default: 0)')
-    parser.add_argument('--marker-size', type=float, default=0.05, help='ArUco marker size in meters (default: 0.05)')
+    parser.add_argument('--marker-size', type=float, default=0.09, help='ArUco marker size in meters (default: 0.05)')
     parser.add_argument('--use-checkerboard', action='store_true', help='Use checkerboard instead of ArUco marker')
     parser.add_argument('--calibrate-only', action='store_true', help='Only perform camera calibration')
     parser.add_argument('--skip-calibration', action='store_true', help='Skip intrinsic calibration and use rough camera parameters')
-    
+    parser.add_argument('--opencv-coords', action='store_true', help='Output in OpenCV coordinate system (default: OptiTrack)')
     args = parser.parse_args()
-    
     estimator = CameraExtrinsicsEstimator(camera_id=args.camera, marker_size=args.marker_size)
-    
     if args.calibrate_only:
         if estimator.initialize_camera():
             estimator.calibrate_camera()
             estimator.save_calibration('camera_calibration.npz')
             estimator.cleanup()
     else:
-        estimator.run_extrinsics_estimation(use_aruco=not args.use_checkerboard, skip_calibration=args.skip_calibration)
+        estimator.run_extrinsics_estimation(use_aruco=not args.use_checkerboard, skip_calibration=args.skip_calibration, use_optitrack_coords=not args.opencv_coords)
 
 
 if __name__ == "__main__":
